@@ -191,8 +191,13 @@ async def send_history(
                 # User message with emoji prefix (no newline)
                 lines.append(f"👤 {msg_text}")
             elif content_type == "thinking":
-                # Thinking prefix to match real-time format
-                lines.append(f"∴ Thinking…\n{msg_text}")
+                thinking_tokens = msg.get("thinking_tokens", 0)
+                if not isinstance(thinking_tokens, int) or thinking_tokens < 0:
+                    thinking_tokens = 0
+                if thinking_tokens == 0 and msg_text.strip():
+                    thinking_tokens = max(1, len(msg_text.strip()) // 4)
+                depth = "深度" if thinking_tokens > 500 else "快速"
+                lines.append(f"🧠 {depth}思考 (~{thinking_tokens} tokens)")
             else:
                 lines.append(msg_text)
         full_text = "\n\n".join(lines)

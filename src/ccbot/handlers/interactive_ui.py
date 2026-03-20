@@ -22,6 +22,7 @@ from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
 from .callback_data import (
+    CB_ASK_APPROVE_ALL,
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
@@ -39,11 +40,35 @@ logger = logging.getLogger(__name__)
 # Tool names that trigger interactive UI via JSONL (terminal capture + inline keyboard)
 INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 
+# Permission-like UIs that can be approved by sending Enter.
+AUTO_APPROVE_UI_NAMES = frozenset({"PermissionPrompt", "BashApproval"})
+
 # Track interactive UI message IDs: (user_id, thread_id_or_0) -> message_id
 _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+# Users whose permission prompts should be auto-approved.
+_auto_approve_users: set[int] = set()
+
+
+def is_auto_approve(user_id: int) -> bool:
+    """Return whether auto-approve is enabled for a user."""
+    return user_id in _auto_approve_users
+
+
+def set_auto_approve(user_id: int, enabled: bool) -> None:
+    """Enable or disable auto-approve mode for a user."""
+    if enabled:
+        _auto_approve_users.add(user_id)
+    else:
+        _auto_approve_users.discard(user_id)
+
+
+def is_auto_approvable_ui(ui_name: str) -> bool:
+    """Return whether a UI can be auto-approved with Enter."""
+    return ui_name in AUTO_APPROVE_UI_NAMES
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -89,6 +114,15 @@ def _build_interactive_keyboard(
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []
+    if is_auto_approvable_ui(ui_name):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ 全部批准",
+                    callback_data=f"{CB_ASK_APPROVE_ALL}{window_id}"[:64],
+                )
+            ]
+        )
     # Row 1: directional keys
     rows.append(
         [
@@ -177,6 +211,17 @@ async def handle_interactive_ui(
     content = extract_interactive_content(pane_text)
     if not content:
         return False
+
+    if is_auto_approve(user_id) and is_auto_approvable_ui(content.name):
+        await clear_interactive_msg(user_id, bot, thread_id)
+        approved = await session_manager.send_enter_to_window(window_id)
+        if not approved:
+            logger.warning(
+                "Auto-approve Enter failed for user %d window_id %s",
+                user_id,
+                window_id,
+            )
+        return approved
 
     # Build message with navigation keyboard
     keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)

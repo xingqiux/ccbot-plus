@@ -23,6 +23,7 @@ def build_response_parts(
     is_complete: bool,
     content_type: str = "text",
     role: str = "assistant",
+    thinking_tokens: int = 0,
 ) -> list[str]:
     """Build paginated response messages for Telegram.
 
@@ -41,24 +42,18 @@ def build_response_parts(
             text = text[:3000] + "…"
         return [f"{prefix}{text}"]
 
-    # Truncate thinking content to keep it compact
-    if content_type == "thinking" and is_complete:
-        start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
-        end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
-        max_thinking = 500
-        if start_tag in text and end_tag in text:
-            inner = text[text.index(start_tag) + len(start_tag) : text.index(end_tag)]
-            if len(inner) > max_thinking:
-                inner = inner[:max_thinking] + "\n\n… (thinking truncated)"
-            text = start_tag + inner + end_tag
-        elif len(text) > max_thinking:
-            text = text[:max_thinking] + "\n\n… (thinking truncated)"
-
     # Format based on content type
     if content_type == "thinking":
-        # Thinking: prefix with "∴ Thinking…" and single newline
-        prefix = "∴ Thinking…"
-        separator = "\n"
+        if thinking_tokens <= 0 and text:
+            stripped = (
+                text.replace(TranscriptParser.EXPANDABLE_QUOTE_START, "")
+                .replace(TranscriptParser.EXPANDABLE_QUOTE_END, "")
+                .strip()
+            )
+            if stripped:
+                thinking_tokens = max(1, len(stripped) // 4)
+        depth = "深度" if thinking_tokens > 500 else "快速"
+        return [f"🧠 {depth}思考 (~{thinking_tokens} tokens)"]
     else:
         # Plain text: no prefix
         prefix = ""

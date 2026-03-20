@@ -87,7 +87,7 @@ class Config:
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = (
-            os.getenv("CCBOT_SHOW_USER_MESSAGES", "true").lower() != "false"
+            os.getenv("CCBOT_SHOW_USER_MESSAGES", "false").lower() != "false"
         )
 
         # Show tool call notifications (tool_use/tool_result) in Telegram

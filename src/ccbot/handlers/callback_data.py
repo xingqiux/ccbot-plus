@@ -8,7 +8,7 @@ Constants:
   - CB_DIR_*: Directory browser navigation
   - CB_WIN_*: Window picker (bind existing unbound window)
   - CB_SCREENSHOT_*: Screenshot refresh
-  - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
+  - CB_ASK_*: Interactive UI navigation (arrows, enter, esc, batch approve)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
 """
 
@@ -38,6 +38,7 @@ CB_ASK_LEFT = "aq:left:"  # aq:left:<window>
 CB_ASK_RIGHT = "aq:right:"  # aq:right:<window>
 CB_ASK_ESC = "aq:esc:"  # aq:esc:<window>
 CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
+CB_ASK_APPROVE_ALL = "aq:all:"  # aq:all:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>

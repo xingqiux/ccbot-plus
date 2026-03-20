@@ -828,6 +828,18 @@ class SessionManager:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"
 
+    async def send_enter_to_window(self, window_id: str) -> bool:
+        """Send Enter to a tmux window by ID."""
+        window = await tmux_manager.find_window_by_id(window_id)
+        if not window:
+            return False
+        return await tmux_manager.send_keys(
+            window.window_id,
+            "Enter",
+            enter=False,
+            literal=False,
+        )
+
     # --- Message history ---
 
     async def get_recent_messages(
@@ -882,6 +894,7 @@ class SessionManager:
                 "role": e.role,
                 "text": e.text,
                 "content_type": e.content_type,
+                "thinking_tokens": e.thinking_tokens,
                 "timestamp": e.timestamp,
             }
             for e in parsed_entries

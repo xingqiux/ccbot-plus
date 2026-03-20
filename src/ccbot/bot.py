@@ -38,6 +38,7 @@ import logging
 import time
 from pathlib import Path
 
+import httpx
 from telegram import (
     Bot,
     BotCommand,
@@ -59,6 +60,7 @@ from telegram.ext import (
 
 from .config import config
 from .handlers.callback_data import (
+    CB_ASK_APPROVE_ALL,
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
@@ -110,6 +112,9 @@ from .handlers.interactive_ui import (
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    is_auto_approve,
+    is_auto_approvable_ui,
+    set_auto_approve,
     set_interactive_mode,
 )
 from .handlers.message_queue import (
@@ -132,7 +137,11 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    extract_interactive_content,
+    is_interactive_ui,
+)
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -148,12 +157,12 @@ _status_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
-    "clear": "↗ Clear conversation history",
-    "compact": "↗ Compact conversation context",
-    "cost": "↗ Show token/cost usage",
-    "help": "↗ Show Claude Code help",
-    "memory": "↗ Edit CLAUDE.md",
-    "model": "↗ Switch AI model",
+    "clear": "↗ 清空对话历史",
+    "compact": "↗ 压缩上下文",
+    "cost": "↗ 查看 token 用量",
+    "help": "↗ Claude Code 帮助",
+    "memory": "↗ 编辑 CLAUDE.md",
+    "model": "↗ 切换 AI 模型",
 }
 
 
@@ -347,6 +356,37 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(trimmed) > 3000:
             trimmed = trimmed[:3000] + "\n... (truncated)"
         await safe_reply(update.message, f"```\n{trimmed}\n```")
+
+
+async def autoapprove_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Toggle auto-approve mode for permission prompts."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    args = context.args or []
+    if args and args[0].lower() == "on":
+        set_auto_approve(user.id, True)
+        await safe_reply(
+            update.message,
+            "✅ 自动批准已开启。所有权限提示将自动通过。",
+        )
+        return
+    if args and args[0].lower() == "off":
+        set_auto_approve(user.id, False)
+        await safe_reply(update.message, "🔒 自动批准已关闭。")
+        return
+
+    status = "开启" if is_auto_approve(user.id) else "关闭"
+    await safe_reply(
+        update.message,
+        f"自动批准当前：{status}\n用法：/autoapprove on|off",
+    )
 
 
 # --- Screenshot keyboard with quick control keys ---
@@ -605,12 +645,16 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Download the highest-resolution photo
     photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
     # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.jpg
     filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
     file_path = _IMAGES_DIR / filename
-    await tg_file.download_to_drive(file_path)
+    try:
+        tg_file = await photo.get_file()
+        await tg_file.download_to_drive(file_path)
+    except Exception as e:
+        logger.exception("Photo download failed: %s", e)
+        await safe_reply(update.message, "❌ 图片下载失败，请重试。")
+        return
 
     # Build the message to send to Claude Code
     caption = update.message.caption or ""
@@ -690,6 +734,14 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = await transcribe_voice(ogg_data)
     except ValueError as e:
         await safe_reply(update.message, f"⚠ {e}")
+        return
+    except httpx.PoolTimeout:
+        logger.warning("Voice transcription pool timeout")
+        await safe_reply(update.message, "⚠️ 语音转写服务繁忙，请稍后重试。")
+        return
+    except httpx.TimeoutException as e:
+        logger.warning("Voice transcription timeout: %s", e)
+        await safe_reply(update.message, "⚠️ 语音转写超时，请稍后重试。")
         return
     except Exception as e:
         logger.error("Voice transcription failed: %s", e)
@@ -1563,6 +1615,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "noop":
         await query.answer()
 
+    elif data.startswith(CB_ASK_APPROVE_ALL):
+        window_id = data[len(CB_ASK_APPROVE_ALL) :]
+        thread_id = _get_thread_id(update)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window no longer exists", show_alert=True)
+            return
+
+        for _ in range(10):
+            pane_text = await tmux_manager.capture_pane(w.window_id)
+            content = extract_interactive_content(pane_text or "")
+            if not content or not is_auto_approvable_ui(content.name):
+                break
+            if not await session_manager.send_enter_to_window(window_id):
+                break
+            await asyncio.sleep(0.5)
+
+        final_pane = await tmux_manager.capture_pane(w.window_id)
+        final_content = extract_interactive_content(final_pane or "")
+        if final_content:
+            if is_auto_approvable_ui(final_content.name):
+                if not is_auto_approve(user.id):
+                    await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+                await query.answer("⚠️ 仍有待批准项", show_alert=True)
+            else:
+                await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+                await query.answer("✅ 已全部批准")
+        else:
+            await clear_interactive_msg(user.id, context.bot, thread_id)
+            await query.answer("✅ 已全部批准")
+
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
@@ -1776,6 +1859,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             msg.is_complete,
             msg.content_type,
             msg.role,
+            msg.thinking_tokens,
         )
 
         if msg.is_complete:
@@ -1814,13 +1898,14 @@ async def post_init(application: Application) -> None:
     await application.bot.delete_my_commands()
 
     bot_commands = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("history", "Message history for this topic"),
-        BotCommand("screenshot", "Terminal screenshot with control keys"),
-        BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("start", "🤖 欢迎信息与使用说明"),
+        BotCommand("history", "🤖 查看本话题消息历史"),
+        BotCommand("screenshot", "🤖 终端截图与控制键"),
+        BotCommand("esc", "🤖 发送 Esc 中断 Claude"),
+        BotCommand("kill", "🤖 终止会话并删除话题"),
+        BotCommand("unbind", "🤖 解绑话题（保留窗口）"),
+        BotCommand("usage", "🤖 查看 Claude Code 用量"),
+        BotCommand("autoapprove", "🤖 自动批准权限提示 on/off"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1880,6 +1965,19 @@ async def post_shutdown(application: Application) -> None:
     await close_transcribe_client()
 
 
+async def global_error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Reply instead of failing silently on unhandled exceptions."""
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await safe_reply(update.effective_message, "⚠️ 发生内部错误，请稍后重试。")
+        except Exception:
+            pass
+
+
 def create_bot() -> Application:
     application = (
         Application.builder()
@@ -1896,6 +1994,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("autoapprove", autoapprove_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(
@@ -1927,5 +2026,6 @@ def create_bot() -> Application:
             unsupported_content_handler,
         )
     )
+    application.add_error_handler(global_error_handler)
 
     return application

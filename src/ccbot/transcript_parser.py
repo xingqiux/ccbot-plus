@@ -41,6 +41,7 @@ class ParsedEntry:
         str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
     )
     tool_use_id: str | None = None
+    thinking_tokens: int = 0
     timestamp: str | None = None  # ISO timestamp from JSONL
     tool_name: str | None = (
         None  # For tool_use entries, the tool name (e.g. "AskUserQuestion")
@@ -343,6 +344,29 @@ class TranscriptParser:
         """
         return f"{cls.EXPANDABLE_QUOTE_START}{text}{cls.EXPANDABLE_QUOTE_END}"
 
+    @staticmethod
+    def _estimate_thinking_tokens(thinking_text: str) -> int:
+        """Estimate thinking token count when JSONL omits explicit metadata."""
+        stripped = thinking_text.strip()
+        if not stripped:
+            return 0
+        return max(1, len(stripped) // 4)
+
+    @classmethod
+    def _extract_thinking_tokens(
+        cls,
+        data: dict[str, Any],
+        message: dict[str, Any],
+        block: dict[str, Any],
+        thinking_text: str,
+    ) -> int:
+        """Extract thinking token metadata from known JSONL locations."""
+        for source in (block, message, data):
+            value = source.get("thinking_tokens")
+            if isinstance(value, int) and value >= 0:
+                return value
+        return cls._estimate_thinking_tokens(thinking_text)
+
     @classmethod
     def _format_tool_result_text(cls, text: str, tool_name: str | None = None) -> str:
         """Format tool result text with statistics summary.
@@ -560,13 +584,19 @@ class TranscriptParser:
 
                     elif btype == "thinking":
                         thinking_text = block.get("thinking", "")
-                        if thinking_text:
-                            quoted = cls._format_expandable_quote(thinking_text)
+                        thinking_tokens = cls._extract_thinking_tokens(
+                            data,
+                            message,
+                            block,
+                            thinking_text,
+                        )
+                        if thinking_text or thinking_tokens > 0:
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text=quoted,
+                                    text="",
                                     content_type="thinking",
+                                    thinking_tokens=thinking_tokens,
                                     timestamp=entry_timestamp,
                                 )
                             )
@@ -574,8 +604,9 @@ class TranscriptParser:
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text="(thinking)",
+                                    text="",
                                     content_type="thinking",
+                                    thinking_tokens=thinking_tokens,
                                     timestamp=entry_timestamp,
                                 )
                             )

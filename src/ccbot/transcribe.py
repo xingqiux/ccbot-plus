@@ -21,7 +21,9 @@ def _get_client() -> httpx.AsyncClient:
     """Return a lazily-initialized httpx client singleton."""
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=30.0)
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+        )
     return _client
 
 

@@ -45,6 +45,7 @@ class NewMessage:
     text: str
     is_complete: bool  # True when stop_reason is set (final message)
     content_type: str = "text"  # "text" or "thinking"
+    thinking_tokens: int = 0
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
@@ -346,7 +347,11 @@ class SessionMonitor:
                     self._pending_tools.pop(session_info.session_id, None)
 
                 for entry in parsed_entries:
-                    if not entry.text and not entry.image_data:
+                    if (
+                        not entry.text
+                        and not entry.image_data
+                        and entry.content_type != "thinking"
+                    ):
                         continue
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
@@ -357,6 +362,7 @@ class SessionMonitor:
                             text=entry.text,
                             is_complete=True,
                             content_type=entry.content_type,
+                            thinking_tokens=entry.thinking_tokens,
                             tool_use_id=entry.tool_use_id,
                             role=entry.role,
                             tool_name=entry.tool_name,
