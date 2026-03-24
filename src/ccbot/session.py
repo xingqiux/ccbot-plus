@@ -36,6 +36,7 @@ from .config import config
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
+from .topic_logger import log_topic_event
 
 logger = logging.getLogger(__name__)
 
@@ -746,6 +747,13 @@ class SessionManager:
             display,
             user_id,
         )
+        log_topic_event(
+            user_id,
+            thread_id,
+            "bind",
+            window=window_id,
+            display=display,
+        )
 
     def unbind_thread(self, user_id: int, thread_id: int) -> str | None:
         """Remove a thread binding. Returns the previously bound window_id, or None."""
@@ -762,6 +770,7 @@ class SessionManager:
             window_id,
             user_id,
         )
+        log_topic_event(user_id, thread_id, "unbind", window=window_id)
         return window_id
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
@@ -812,7 +821,10 @@ class SessionManager:
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID."""
+        """Send text to a tmux window by ID.
+
+        Guards against sending to a window where Claude has exited (bash prompt).
+        """
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -823,6 +835,13 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+        # Guard: reject if Claude is not the foreground process
+        if window.pane_current_command not in ("claude", "node"):
+            return False, (
+                f"⚠️ Claude Code 未运行"
+                f"（当前进程：{window.pane_current_command}），"
+                "正在等待自动重启..."
+            )
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"

@@ -12,6 +12,8 @@ Core responsibilities:
     Unbound topics trigger the directory browser to create a new session.
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
+  - Document handling: file uploads (PDF, TXT, etc.) are downloaded and
+    forwarded to Claude Code as file paths (document_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
     forwarded as text (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
@@ -143,6 +145,7 @@ from .terminal_parser import (
     is_interactive_ui,
 )
 from .tmux_manager import tmux_manager
+from .topic_logger import log_topic_event
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
@@ -564,6 +567,10 @@ async def forward_command_handler(
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
+        if thread_id is not None:
+            log_topic_event(
+                user.id, thread_id, "msg_sent", type="command", cmd=cc_slash
+            )
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
@@ -591,7 +598,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, photo, voice, and document messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
 
@@ -673,6 +680,102 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
+    log_topic_event(user.id, thread_id, "msg_sent", type="photo", file=str(file_path))
+
+
+# --- File directory for incoming documents ---
+_FILES_DIR = ccbot_dir() / "files"
+_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle document uploads: download and forward file path to Claude Code."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    if not update.message or not update.message.document:
+        return
+
+    chat = update.message.chat
+    thread_id = _get_thread_id(update)
+    if chat.type in ("group", "supergroup") and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    # Must be in a named topic
+    if thread_id is None:
+        await safe_reply(
+            update.message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid is None:
+        await safe_reply(
+            update.message,
+            "❌ No session bound to this topic. Send a text message first to create one.",
+        )
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            update.message,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
+    # Download the document
+    doc = update.message.document
+    original_name = doc.file_name or f"file_{doc.file_unique_id}"
+    filename = f"{int(time.time())}_{original_name}"
+    file_path = _FILES_DIR / filename
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(file_path)
+    except Exception as e:
+        logger.exception("Document download failed: %s", e)
+        await safe_reply(update.message, "❌ 文件下载失败，请重试。")
+        return
+
+    # Build the message to send to Claude Code
+    caption = update.message.caption or ""
+    if caption:
+        text_to_send = f"{caption}\n\n(file attached: {file_path})"
+    else:
+        text_to_send = f"(file attached: {file_path})"
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    clear_status_msg_info(user.id, thread_id)
+
+    success, message = await session_manager.send_to_window(wid, text_to_send)
+    if not success:
+        await safe_reply(update.message, f"❌ {message}")
+        return
+
+    # Confirm to user with file info
+    size_kb = (doc.file_size or 0) / 1024
+    if size_kb >= 1024:
+        size_str = f"{size_kb / 1024:.1f} MB"
+    else:
+        size_str = f"{size_kb:.1f} KB"
+    await safe_reply(
+        update.message, f"📎 File sent to Claude Code. ({original_name}, {size_str})"
+    )
+    log_topic_event(
+        user.id,
+        thread_id,
+        "msg_sent",
+        type="document",
+        file=original_name,
+        size=size_str,
+    )
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1023,6 +1126,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
+
+    log_topic_event(user.id, thread_id, "msg_sent", type="text", length=len(text))
 
     # Start background capture for ! bash command output
     if text.startswith("!") and len(text) > 1:
@@ -1637,7 +1742,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if final_content:
             if is_auto_approvable_ui(final_content.name):
                 if not is_auto_approve(user.id):
-                    await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+                    await handle_interactive_ui(
+                        context.bot, user.id, window_id, thread_id
+                    )
                 await query.answer("⚠️ 仍有待批准项", show_alert=True)
             else:
                 await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
@@ -1819,6 +1926,13 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
+        log_topic_event(
+            user_id,
+            thread_id,
+            "msg_received",
+            type=msg.content_type,
+            length=len(msg.text),
+        )
         # Handle interactive tools specially - capture terminal and send UI
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             # Mark interactive mode BEFORE sleeping so polling skips this window
@@ -1851,7 +1965,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         parts = build_response_parts(
@@ -2017,6 +2134,8 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to Claude Code
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # Documents: download and forward file path to Claude Code
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
     # Catch-all: non-text content (stickers, video, etc.)

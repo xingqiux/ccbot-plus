@@ -8,12 +8,14 @@ Provides background polling of terminal status lines for all active users:
   - Periodically probes topic existence via unpin_all_forum_topic_messages
     (silent no-op when no pins); cleans up deleted topics (kills tmux window
     + unbinds thread)
+  - Detects Claude Code process exit and auto-restarts with --resume
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
+  - Auto-restart: detects pane_current_command != claude/node, restarts with cooldown
 """
 
 import asyncio
@@ -23,9 +25,10 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import TmuxWindow, tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -33,6 +36,8 @@ from .interactive_ui import (
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import safe_send
+from ..topic_logger import log_topic_event
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,105 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# --- Auto-restart constants and state ---
+_CLAUDE_PROCESS_NAMES = frozenset({"claude", "node"})
+MAX_RESTARTS = 3
+COOLDOWN_SECONDS = 300.0  # 5 minutes
+# Per-window restart tracking: window_id → list of monotonic timestamps
+_restart_history: dict[str, list[float]] = {}
+# Track windows we've already notified about (avoid spamming every 1s poll)
+_notified_exited: set[str] = set()
+
+
+def _is_claude_running(window: TmuxWindow) -> bool:
+    """Check if Claude Code is the foreground process in a tmux window."""
+    return window.pane_current_command in _CLAUDE_PROCESS_NAMES
+
+
+def _can_restart(window_id: str) -> bool:
+    """Check if auto-restart is allowed (within cooldown limits)."""
+    now = time.monotonic()
+    history = _restart_history.get(window_id, [])
+    # Prune entries older than cooldown
+    history = [t for t in history if now - t < COOLDOWN_SECONDS]
+    _restart_history[window_id] = history
+    return len(history) < MAX_RESTARTS
+
+
+async def _auto_restart_claude(
+    bot: Bot, user_id: int, window_id: str, thread_id: int
+) -> None:
+    """Detect Claude exit and auto-restart with --resume if possible."""
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    display = session_manager.get_display_name(window_id)
+
+    if not _can_restart(window_id):
+        # Over limit — notify once then stop
+        if window_id not in _notified_exited:
+            _notified_exited.add(window_id)
+            log_topic_event(
+                user_id,
+                thread_id,
+                "auto_restart_limit",
+                window=window_id,
+                display=display,
+            )
+            await safe_send(
+                bot,
+                chat_id,
+                f"❌ [{display}] Claude Code 反复退出（5 分钟内 {MAX_RESTARTS} 次），"
+                "已停止自动重启，请手动处理。",
+                message_thread_id=thread_id,
+            )
+            logger.warning(
+                "Auto-restart limit reached for window %s (user=%d, thread=%d)",
+                window_id,
+                user_id,
+                thread_id,
+            )
+        return
+
+    # Record this restart attempt
+    _restart_history.setdefault(window_id, []).append(time.monotonic())
+    _notified_exited.discard(window_id)
+
+    # Build restart command
+    state = session_manager.get_window_state(window_id)
+    if state.session_id:
+        cmd = f"{config.claude_command} --resume {state.session_id}"
+    else:
+        cmd = config.claude_command
+
+    success = await tmux_manager.send_keys(window_id, cmd)
+    if success:
+        log_topic_event(
+            user_id,
+            thread_id,
+            "auto_restart",
+            window=window_id,
+            cmd=cmd,
+        )
+        await safe_send(
+            bot,
+            chat_id,
+            f"⚠️ [{display}] Claude Code 已退出，正在自动重启...",
+            message_thread_id=thread_id,
+        )
+        logger.info(
+            "Auto-restarting Claude in window %s with: %s (user=%d, thread=%d)",
+            window_id,
+            cmd,
+            user_id,
+            thread_id,
+        )
+    else:
+        logger.error(
+            "Failed to send restart command to window %s (user=%d, thread=%d)",
+            window_id,
+            user_id,
+            thread_id,
+        )
 
 
 async def update_status_message(
@@ -179,6 +283,14 @@ async def status_poll_loop(bot: Bot) -> None:
                             wid,
                         )
                         continue
+
+                    # Detect Claude exit and auto-restart
+                    if not _is_claude_running(w):
+                        await _auto_restart_claude(bot, user_id, wid, thread_id)
+                        continue
+
+                    # Claude is running — clear any previous exit notification state
+                    _notified_exited.discard(wid)
 
                     # UI detection happens unconditionally in update_status_message.
                     # Status enqueue is skipped inside update_status_message when
