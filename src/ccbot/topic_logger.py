@@ -12,7 +12,6 @@ Key function: log_topic_event(user_id, thread_id, event, **details)
 import logging
 import re
 
-from .session import session_manager
 from .utils import ccbot_dir
 
 _LOGS_DIR = ccbot_dir() / "logs"
@@ -23,6 +22,13 @@ _topic_loggers: dict[tuple[int, int], logging.Logger] = {}
 
 # Sanitize display names for filenames
 _SAFE_NAME_RE = re.compile(r"[^\w\-.]", re.UNICODE)
+
+
+def _get_session_manager():  # type: ignore[no-untyped-def]
+    """Lazy import to avoid circular dependency with session.py."""
+    from .session import session_manager
+
+    return session_manager
 
 
 def _sanitize_name(name: str) -> str:
@@ -38,8 +44,9 @@ def get_topic_logger(user_id: int, thread_id: int) -> logging.Logger:
         return _topic_loggers[key]
 
     # Resolve display name from thread binding
-    wid = session_manager.get_window_for_thread(user_id, thread_id)
-    display = session_manager.get_display_name(wid) if wid else "unbound"
+    sm = _get_session_manager()
+    wid = sm.get_window_for_thread(user_id, thread_id)
+    display = sm.get_display_name(wid) if wid else "unbound"
     safe_name = _sanitize_name(display)
 
     log_file = _LOGS_DIR / f"topic-{thread_id}-{safe_name}.log"
@@ -72,11 +79,12 @@ def log_topic_event(
         **details: Additional key-value pairs to include in the log line
     """
     topic_logger = get_topic_logger(user_id, thread_id)
-    wid = session_manager.get_window_for_thread(user_id, thread_id)
+    sm = _get_session_manager()
+    wid = sm.get_window_for_thread(user_id, thread_id)
     parts = [f"event={event}"]
     if wid:
         parts.append(f"window={wid}")
-        state = session_manager.get_window_state(wid)
+        state = sm.get_window_state(wid)
         if state.session_id:
             parts.append(f"session={state.session_id[:8]}...")
     for k, v in details.items():
