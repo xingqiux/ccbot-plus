@@ -59,6 +59,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from .config import config
 from .handlers.callback_data import (
@@ -157,6 +158,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Connection pool health check task
+_pool_health_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -2010,7 +2014,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _pool_health_task
 
     await application.bot.delete_my_commands()
 
@@ -2058,9 +2062,13 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start pool health check task
+    _pool_health_task = asyncio.create_task(_pool_health_check(application))
+    logger.info("Pool health check task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _pool_health_task
 
     # Stop status polling
     if _status_poll_task:
@@ -2072,6 +2080,16 @@ async def post_shutdown(application: Application) -> None:
         _status_poll_task = None
         logger.info("Status polling stopped")
 
+    # Stop pool health check
+    if _pool_health_task:
+        _pool_health_task.cancel()
+        try:
+            await _pool_health_task
+        except asyncio.CancelledError:
+            pass
+        _pool_health_task = None
+        logger.info("Pool health check stopped")
+
     # Stop all queue workers
     await shutdown_workers()
 
@@ -2080,6 +2098,35 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Session monitor stopped")
 
     await close_transcribe_client()
+
+
+async def _pool_health_check(application: Application) -> None:
+    """Periodically verify httpx connection pool is healthy.
+
+    Calls getMe() every 5 minutes. If the call fails with pool/connection
+    errors, shuts down and reinitializes the request objects to get fresh
+    connection pools.
+    """
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await asyncio.wait_for(application.bot.get_me(), timeout=15.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Pool health check failed: %s. Recycling connection pools.", exc
+            )
+            try:
+                bot = application.bot
+                await bot.request.shutdown()
+                await bot.request.initialize()
+                if bot.request is not bot.get_updates_request:
+                    await bot.get_updates_request.shutdown()
+                    await bot.get_updates_request.initialize()
+                logger.info("Connection pools recycled successfully")
+            except Exception as reinit_err:
+                logger.error("Failed to recycle pools: %s", reinit_err)
 
 
 async def global_error_handler(
@@ -2096,10 +2143,44 @@ async def global_error_handler(
 
 
 def create_bot() -> Application:
+    # Main request pool (sendMessage, editMessage, etc.)
+    request = HTTPXRequest(
+        connection_pool_size=100,
+        pool_timeout=5.0,
+        connect_timeout=10.0,
+        read_timeout=10.0,
+        write_timeout=10.0,
+        httpx_kwargs={
+            "limits": httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            ),
+        },
+    )
+
+    # getUpdates long-polling pool
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=1,
+        pool_timeout=5.0,
+        connect_timeout=10.0,
+        read_timeout=30.0,
+        write_timeout=10.0,
+        httpx_kwargs={
+            "limits": httpx.Limits(
+                max_connections=1,
+                max_keepalive_connections=1,
+                keepalive_expiry=60,
+            ),
+        },
+    )
+
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
+        .request(request)
+        .get_updates_request(get_updates_request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
