@@ -2119,11 +2119,25 @@ async def _pool_health_check(application: Application) -> None:
             )
             try:
                 bot = application.bot
-                await bot.request.shutdown()
-                await bot.request.initialize()
-                if bot.request is not bot.get_updates_request:
-                    await bot.get_updates_request.shutdown()
-                    await bot.get_updates_request.initialize()
+                requests = []
+
+                main_request = getattr(bot, "request", None)
+                if main_request is not None:
+                    requests.append(main_request)
+
+                updates_request = getattr(bot, "get_updates_request", None)
+                if updates_request is None:
+                    request_tuple = getattr(bot, "_request", ())
+                    if isinstance(request_tuple, tuple) and request_tuple:
+                        updates_request = request_tuple[0]
+
+                if updates_request is not None and updates_request not in requests:
+                    requests.append(updates_request)
+
+                for request_obj in requests:
+                    await request_obj.shutdown()
+                for request_obj in requests:
+                    await request_obj.initialize()
                 logger.info("Connection pools recycled successfully")
             except Exception as reinit_err:
                 logger.error("Failed to recycle pools: %s", reinit_err)
